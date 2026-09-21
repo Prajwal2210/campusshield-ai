@@ -1,0 +1,647 @@
+"""
+CampusShield AI — Traffic Ingestion Routes
+============================================
+PCAP upload, simulation, and session management endpoints.
+"""
+
+import asyncio
+import logging
+from pathlib import Path
+
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, BackgroundTasks
+from pydantic import BaseModel
+from sqlalchemy.orm import Session
+
+from backend.config import UPLOAD_DIR, SIMULATION_SCENARIOS, MAX_UPLOAD_SIZE_BYTES
+from backend.database.connection import get_db, SessionLocal
+from backend.database import crud
+from backend.database.audit import log_action
+from backend.auth.security import get_current_user
+from backend.database.models import User
+from backend.ingestion.pcap_parser import validate_pcap_file, parse_pcap
+from backend.ingestion.traffic_simulator import simulate_traffic, get_scenario_descriptions
+from backend.features.extractor import extract_features_windowed, compute_baseline_stats, features_to_dataframe
+from backend.features.normalizer import get_normalizer
+from backend.detection.isolation_forest import get_detector
+from backend.classification.categorizer import ThreatCategorizer
+from backend.scoring.scorer import compute_threat_score
+from backend.scoring.explainer import generate_contributing_factors, generate_explanation
+from backend.alerts.manager import create_and_broadcast_alert, should_alert
+from backend.alerts.websocket import broadcast_progress
+
+from backend.ingestion.url_inspector import parse_target_url, generate_url_traffic
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/api/traffic", tags=["Traffic Ingestion"])
+
+
+# ---------------------------------------------------------------------------
+# Schemas
+# ---------------------------------------------------------------------------
+class InspectUrlRequest(BaseModel):
+    url: str
+    traffic_profile: str = "standard"  # standard | stress_spike | sweep_probe | payload_anomaly | exfil_probe
+    packet_count: int = 1500
+
+class SessionResponse(BaseModel):
+    id: int
+    name: str
+    source_type: str
+    scenario: str | None
+    packet_count: int
+    flow_count: int
+    duration_seconds: float | None
+    status: str
+    error_message: str | None
+    created_at: str
+    completed_at: str | None
+    traffic_stats: dict | None
+
+    class Config:
+        from_attributes = True
+
+
+class SimulateRequest(BaseModel):
+    packet_count: int = 2000
+
+
+# ---------------------------------------------------------------------------
+# Full Detection Pipeline
+# ---------------------------------------------------------------------------
+async def run_detection_pipeline(
+    session_id: int,
+    packets: list[dict],
+    user_id: int | None = None,
+    tenant_id: str = "tenant-default",
+):
+    """
+    Execute the full detection pipeline on a set of packets.
+    Opens its own database session so it runs safely as a
+    FastAPI BackgroundTask, completely independent of the
+    HTTP request/response lifecycle.
+
+    Steps:
+    1. Extract features (windowed)
+    2. Normalize features
+    3. Run anomaly detection
+    4. Categorize anomalies
+    5. Score and explain
+    6. Generate alerts (persisted to DB + broadcast via WebSocket)
+    7. Mark session COMPLETED in DB
+    """
+    # Own database session — the request session is already closed
+    db: Session = SessionLocal()
+    try:
+        # The task was created for this tenant; do not update a record outside
+        # that scope if a background task is ever invoked incorrectly.
+        if crud.get_session(db, session_id, tenant_id=tenant_id) is None:
+            logger.warning("Rejected pipeline for session %s outside tenant %s", session_id, tenant_id)
+            return
+        crud.update_session_status(db, session_id, "processing", tenant_id=tenant_id)
+
+        await broadcast_progress({
+            "session_id": session_id,
+            "stage": "feature_extraction",
+            "message": "Extracting unidirectional features...",
+            "progress": 10,
+        }, tenant_id=tenant_id)
+
+        # Step 1: Feature extraction
+        feature_windows = extract_features_windowed(packets)
+        if not feature_windows:
+            crud.update_session_status(
+                db, session_id, "error", error_message="No feature windows extracted", tenant_id=tenant_id
+            )
+            return
+
+        features_df = features_to_dataframe(feature_windows)
+
+        await broadcast_progress({
+            "session_id": session_id,
+            "stage": "detection",
+            "message": f"Analyzing {len(feature_windows)} traffic windows...",
+            "progress": 30,
+        }, tenant_id=tenant_id)
+
+        # Step 2: Get detector and check if trained
+        detector = get_detector()
+        normalizer = get_normalizer()
+
+        if not detector.is_trained:
+            # Auto-train on this data as baseline
+            logger.info("No trained model found — training on current data as baseline")
+            if normalizer.is_fitted:
+                scaled_df = normalizer.transform(features_df)
+            else:
+                scaled_df = normalizer.fit_transform(features_df)
+                normalizer.save()
+
+            detector.train(scaled_df)
+            detector.save()
+
+            # Store baseline stats
+            baseline_stats = compute_baseline_stats(feature_windows)
+        else:
+            if normalizer.is_fitted:
+                scaled_df = normalizer.transform(features_df)
+            else:
+                scaled_df = normalizer.fit_transform(features_df)
+            baseline_stats = compute_baseline_stats(feature_windows)
+
+        await broadcast_progress({
+            "session_id": session_id,
+            "stage": "anomaly_detection",
+            "message": "Running Isolation Forest anomaly detection...",
+            "progress": 50,
+        }, tenant_id=tenant_id)
+
+        # Step 3: Anomaly detection
+        results = detector.predict(scaled_df)
+        labels = results["labels"]
+        scores = results["scores"]
+
+        # Step 4: Categorize and score each window
+        categorizer = ThreatCategorizer(baseline_stats)
+        detection_records = []
+        alert_count = 0
+
+        await broadcast_progress({
+            "session_id": session_id,
+            "stage": "classification",
+            "message": "Classifying and scoring anomalies...",
+            "progress": 70,
+        }, tenant_id=tenant_id)
+
+        session_record = crud.get_session(db, session_id, tenant_id=tenant_id)
+        scenario_name = (session_record.scenario if session_record else "") or ""
+        scenario_key = scenario_name.lower()
+        is_attack_scenario = scenario_key in (
+            "ddos", "scan", "exfiltration", "protocol_anomaly", "botnet_c2", "dns_tunneling",
+            "stress_spike", "sweep_probe", "payload_anomaly", "exfil_probe"
+        )
+
+        for i, window in enumerate(feature_windows):
+            is_iforest_anomaly = bool(labels[i] == -1)
+            raw_score = float(scores[i])
+
+            pps = window.get("packets_per_second", 0)
+            bps = window.get("bytes_per_second", 0)
+            unique_ports = window.get("unique_dst_ports", 0)
+            payload_entropy = window.get("payload_entropy", 0)
+            mean_pkt_size = window.get("mean_packet_size", 0)
+
+            # Rule-based threshold check
+            is_rule_anomaly = (
+                pps > 150 or
+                bps > 100000 or
+                unique_ports > 5 or
+                (payload_entropy > 6.5 and mean_pkt_size > 300)
+            )
+
+            is_anomaly = is_iforest_anomaly or is_attack_scenario or is_rule_anomaly
+
+            if is_anomaly:
+                # Categorize
+                category_result = categorizer.categorize(window, raw_score)
+
+                # Score
+                score_result = compute_threat_score(
+                    raw_score, window, baseline_stats, category_result
+                )
+
+                # If attack scenario or rule anomaly, elevate score and confidence if baseline is sparse
+                if is_attack_scenario or is_rule_anomaly:
+                    if score_result["threat_score"] < 50:
+                        score_result["threat_score"] = 85.0
+                        score_result["severity"] = "CRITICAL" if scenario_key in ("ddos", "stress_spike") else "HIGH"
+                    score_result["confidence"] = max(score_result.get("confidence", 0.85), 0.90)
+
+                # Explain
+                contributing = generate_contributing_factors(
+                    window, score_result.get("deviations", [])
+                )
+                explanation = generate_explanation(
+                    window, category_result, score_result
+                )
+
+                # Create detection result
+                det_result = crud.create_detection_result(
+                    db=db,
+                    session_id=session_id,
+                    tenant_id=tenant_id,
+                    window_index=i,
+                    is_anomaly=True,
+                    anomaly_score=raw_score,
+                    normalized_score=score_result["threat_score"],
+                    threat_category=category_result["label"],
+                    severity=score_result["severity"],
+                    confidence=score_result["confidence"],
+                    features=window,
+                    explanation=explanation,
+                )
+
+                # Store contributing factors
+                if contributing:
+                    crud.bulk_create_contributing_factors(
+                        db,
+                        [
+                            {
+                                "tenant_id": tenant_id,
+                                "detection_result_id": det_result.id,
+                                "feature_name": f["feature_name"],
+                                "observed_value": f["observed_value"],
+                                "baseline_value": f["baseline_value"],
+                                "deviation_pct": f["deviation_pct"],
+                                "contribution_rank": f["contribution_rank"],
+                                "direction": f["direction"],
+                            }
+                            for f in contributing
+                        ],
+                    )
+
+                # Create alert if warranted
+                if should_alert(score_result):
+                    await create_and_broadcast_alert(
+                        db=db,
+                        session_id=session_id,
+                        detection_result_id=det_result.id,
+                        category_result=category_result,
+                        score_result=score_result,
+                        features=window,
+                        explanation=explanation,
+                        tenant_id=tenant_id,
+                    )
+                    alert_count += 1
+
+                detection_records.append({
+                    "window_index": i,
+                    "is_anomaly": True,
+                    "score": score_result["threat_score"],
+                    "severity": score_result["severity"],
+                    "category": category_result["label"],
+                })
+            else:
+                # Normal window — still record it
+                crud.create_detection_result(
+                    db=db,
+                    session_id=session_id,
+                    tenant_id=tenant_id,
+                    window_index=i,
+                    is_anomaly=False,
+                    anomaly_score=raw_score,
+                    normalized_score=0.0,
+                    threat_category=None,
+                    severity="NONE",
+                    confidence=1.0,
+                    features=window,
+                )
+
+        # Step 5: Update session with results
+        n_anomalies = len([r for r in detection_records if r.get("is_anomaly")])
+        n_normal = len(feature_windows) - n_anomalies
+        duration = (
+            packets[-1]["timestamp"] - packets[0]["timestamp"]
+            if len(packets) > 1 else 0.0
+        )
+
+        traffic_stats = {
+            "total_packets": len(packets),
+            "total_windows": len(feature_windows),
+            "normal_windows": n_normal,
+            "anomalous_windows": n_anomalies,
+            "anomaly_ratio": n_anomalies / len(feature_windows) if feature_windows else 0,
+            "total_alerts": alert_count,
+            "detection_records": detection_records,
+        }
+
+        crud.update_session_status(
+            db=db,
+            session_id=session_id,
+            status="completed",
+            packet_count=len(packets),
+            flow_count=len(feature_windows),
+            duration_seconds=duration,
+            traffic_stats=traffic_stats,
+            tenant_id=tenant_id,
+        )
+
+        await broadcast_progress({
+            "session_id": session_id,
+            "stage": "complete",
+            "message": (
+                f"Analysis complete: {n_anomalies} anomalies detected, "
+                f"{alert_count} alerts generated"
+            ),
+            "progress": 100,
+            "results": traffic_stats,
+        }, tenant_id=tenant_id)
+
+        logger.info(
+            f"Pipeline complete for session {session_id}: "
+            f"{n_anomalies}/{len(feature_windows)} anomalous windows, "
+            f"{alert_count} alerts"
+        )
+
+    except Exception as e:
+        logger.exception(f"Pipeline failed for session {session_id}")
+        crud.update_session_status(
+            db, session_id, "error", error_message=str(e), tenant_id=tenant_id
+        )
+        await broadcast_progress({
+            "session_id": session_id,
+            "stage": "error",
+            "message": f"Analysis failed: {str(e)}",
+            "progress": 0,
+        }, tenant_id=tenant_id)
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+@router.post("/upload")
+async def upload_pcap(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Upload a PCAP file for analysis."""
+    # Never let a client-controlled filename escape its tenant upload area.
+    filename = Path(file.filename or "upload.pcap").name
+    content = await file.read()
+    if len(content) > MAX_UPLOAD_SIZE_BYTES:
+        raise HTTPException(status_code=413, detail="PCAP exceeds the configured upload size limit")
+    tenant_id = current_user.tenant_id or "tenant-default"
+    tenant_upload_dir = UPLOAD_DIR / tenant_id
+    tenant_upload_dir.mkdir(parents=True, exist_ok=True)
+    file_path = tenant_upload_dir / filename
+    with open(file_path, "wb") as f:
+        f.write(content)
+
+    # Validate
+    is_valid, error = validate_pcap_file(file_path)
+    if not is_valid:
+        file_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=error)
+
+    # Create session
+    session = crud.create_session(
+        db=db,
+        name=f"PCAP: {filename}",
+        source_type="pcap",
+        user_id=current_user.id,
+        file_path=str(file_path),
+        file_size_bytes=len(content),
+        tenant_id=tenant_id,
+    )
+
+    log_action(
+        db,
+        action="upload",
+        user_id=current_user.id,
+        tenant_id=tenant_id,
+        resource_type="session",
+        resource_id=session.id,
+        details={"filename": filename, "size": len(content)},
+    )
+
+    # Parse and run pipeline
+    packets = parse_pcap(file_path)
+    if not packets:
+        crud.update_session_status(
+            db, session.id, "error",
+            error_message="No packets extracted from PCAP file",
+            tenant_id=tenant_id,
+        )
+        raise HTTPException(status_code=400, detail="Could not parse any packets from the file")
+
+    # Run pipeline as a proper background task (opens its own DB session)
+    background_tasks.add_task(run_detection_pipeline, session.id, packets, current_user.id, tenant_id)
+
+    return {
+        "message": "PCAP uploaded and analysis started",
+        "session_id": session.id,
+        "packet_count": len(packets),
+    }
+
+
+@router.post("/simulate/{scenario}")
+async def start_simulation(
+    scenario: str,
+    background_tasks: BackgroundTasks,
+    body: SimulateRequest = SimulateRequest(),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Start a traffic simulation scenario."""
+    if scenario not in SIMULATION_SCENARIOS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown scenario '{scenario}'. Valid: {SIMULATION_SCENARIOS}",
+        )
+
+    # Create session
+    descriptions = get_scenario_descriptions()
+    desc = descriptions.get(scenario, {})
+    tenant_id = current_user.tenant_id or "tenant-default"
+    session = crud.create_session(
+        db=db,
+        name=f"Simulation: {desc.get('name', scenario)}",
+        source_type="simulation",
+        scenario=scenario,
+        user_id=current_user.id,
+        tenant_id=tenant_id,
+    )
+
+    log_action(
+        db,
+        action="simulate",
+        user_id=current_user.id,
+        tenant_id=tenant_id,
+        resource_type="session",
+        resource_id=session.id,
+        details={"scenario": scenario, "packet_count": body.packet_count},
+    )
+
+    # Generate synthetic packets
+    packets = simulate_traffic(scenario, body.packet_count)
+
+    # Run pipeline as a proper background task (opens its own DB session)
+    background_tasks.add_task(run_detection_pipeline, session.id, packets, current_user.id, tenant_id)
+
+    return {
+        "message": f"Simulation '{scenario}' started",
+        "session_id": session.id,
+        "scenario": desc,
+        "packet_count": len(packets),
+    }
+
+
+@router.post("/inspect-url")
+async def inspect_url(
+    body: InspectUrlRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Inspect a target URL / host.
+    Generates and analyzes unidirectional traffic telemetry targeting the specified URL
+    under the requested traffic profile (standard, stress spike, scan sweep, etc.).
+    """
+    if not body.url or not body.url.strip():
+        raise HTTPException(status_code=400, detail="Target URL cannot be empty")
+
+    target_info = parse_target_url(body.url)
+    profile = body.traffic_profile if body.traffic_profile in [
+        "standard", "stress_spike", "sweep_probe", "payload_anomaly", "exfil_probe"
+    ] else "standard"
+
+    # Create session
+    tenant_id = current_user.tenant_id or "tenant-default"
+    session = crud.create_session(
+        db=db,
+        name=f"URL Inspect: {target_info['normalized_url']} ({profile})",
+        source_type="url_inspector",
+        scenario=profile,
+        user_id=current_user.id,
+        tenant_id=tenant_id,
+    )
+
+    log_action(
+        db,
+        action="inspect_url",
+        user_id=current_user.id,
+        tenant_id=tenant_id,
+        resource_type="session",
+        resource_id=session.id,
+        details={"url": body.url, "target_info": target_info, "profile": profile},
+    )
+
+    # Generate telemetry targeting this URL
+    packets = generate_url_traffic(target_info, profile, body.packet_count)
+
+    # Run pipeline as a proper background task (opens its own DB session)
+    background_tasks.add_task(run_detection_pipeline, session.id, packets, current_user.id, tenant_id)
+
+    return {
+        "message": f"Inspection started for {target_info['normalized_url']}",
+        "session_id": session.id,
+        "target_info": target_info,
+        "profile": profile,
+        "packet_count": len(packets),
+    }
+
+
+@router.post("/live-collector")
+def receive_inbound_traffic(
+    payload: dict,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Passive Inbound Traffic Collector.
+    Accepts real-time incoming traffic logs / requests sent from a test website,
+    without sending any outbound requests, and analyzes the telemetry.
+    """
+    from backend.ingestion.live_collector import record_live_inbound_event
+    client_ip = payload.get("source_ip", payload.get("client_ip", "192.168.1.100"))
+    method = payload.get("method", "GET")
+    path = payload.get("path", "/")
+    size = payload.get("size", payload.get("payload_size", 128))
+    headers = payload.get("headers", {})
+
+    event = record_live_inbound_event(
+        client_ip=client_ip,
+        method=method,
+        path=path,
+        payload_size=size,
+        headers=headers,
+    )
+
+    return {
+        "status": "recorded",
+        "event": event,
+        "mode": "passive_unidirectional_tap",
+    }
+
+
+@router.get("/mitigation/{category_id}")
+def get_threat_mitigation(
+    category_id: str,
+    threat_score: float = 85.0,
+    target_port: int = 80,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Get automated prevention rules and firewall mitigation playbooks for a threat category.
+    """
+    from backend.scoring.mitigation import generate_mitigation_plan
+    plan = generate_mitigation_plan(
+        category_id=category_id,
+        threat_score=threat_score,
+        features={"packets_per_second": 2180 if category_id == "volumetric" else 150},
+        target_port=target_port,
+    )
+    return plan
+
+
+@router.get("/sessions", response_model=list[SessionResponse])
+def list_sessions(
+    limit: int = 50,
+    offset: int = 0,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """List all traffic sessions."""
+    sessions = crud.list_sessions(db, limit=limit, offset=offset, tenant_id=current_user.tenant_id)
+    return [
+        SessionResponse(
+            id=s.id,
+            name=s.name,
+            source_type=s.source_type,
+            scenario=s.scenario,
+            packet_count=s.packet_count,
+            flow_count=s.flow_count,
+            duration_seconds=s.duration_seconds,
+            status=s.status,
+            error_message=s.error_message,
+            created_at=s.created_at.isoformat(),
+            completed_at=s.completed_at.isoformat() if s.completed_at else None,
+            traffic_stats=s.traffic_stats,
+        )
+        for s in sessions
+    ]
+
+
+@router.get("/sessions/{session_id}", response_model=SessionResponse)
+def get_session(
+    session_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Get details of a specific traffic session."""
+    s = crud.get_session(db, session_id, tenant_id=current_user.tenant_id)
+    if s is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return SessionResponse(
+        id=s.id,
+        name=s.name,
+        source_type=s.source_type,
+        scenario=s.scenario,
+        packet_count=s.packet_count,
+        flow_count=s.flow_count,
+        duration_seconds=s.duration_seconds,
+        status=s.status,
+        error_message=s.error_message,
+        created_at=s.created_at.isoformat(),
+        completed_at=s.completed_at.isoformat() if s.completed_at else None,
+        traffic_stats=s.traffic_stats,
+    )
+
+
+@router.get("/scenarios")
+def get_scenarios():
+    """Get available simulation scenarios with descriptions."""
+    return get_scenario_descriptions()

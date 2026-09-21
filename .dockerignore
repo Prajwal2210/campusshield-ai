@@ -1,8 +1,64 @@
+# ── CampusShield AI — Docker build-context exclusions ────────────────────────
+# Rule: exclude everything that is NOT needed inside the container image.
+# Model files (*.joblib) are intentionally NOT excluded — they are required
+# at runtime by the anomaly detector and feature normalizer (lazy-loaded).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Version control
 .git
-venv
-.venv
-frontend/node_modules
-frontend/dist
-backend/__pycache__
+.gitignore
+
+# Python virtual environments
+venv/
+.venv/
+
+# Python bytecode (all depths)
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+
+# Test artefacts — not needed in the runtime image
+.pytest_cache/
+pytest.ini
+
+# Environment files — secrets must never be baked into an image layer
+.env
+.env.*
+frontend/.env
+frontend/.env.*
+
+# IDE / editor config
+.vscode/
+.kiro/
+.python-version
+
+# Frontend build artefacts (rebuilt inside the frontend image stage)
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Root-level npm wrapper (not used inside Docker containers)
+package.json
+package-lock.json
+
+# Legacy SQLite database (Neon PostgreSQL is the active database)
 backend/data/campusshield.db*
-*.pyc
+
+# Pre-generated reports and uploads — these are runtime-written via the
+# named volume; existing files on the host are not needed in the image
+backend/data/reports/
+backend/data/uploads/
+
+# Alternative deployment artefacts (Vercel / Heroku — not used in Docker)
+Procfile
+vercel.json
+frontend/vercel.json
+api/
+
+# Documentation and utility scripts — not part of the running application
+docs/
+scripts/
+*.md
+KIRO-SPECIFICATION.md
+deploy.md

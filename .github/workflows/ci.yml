@@ -1,0 +1,124 @@
+# ── CampusShield AI — Continuous Integration ─────────────────────────────────
+#
+# Runs on every push and pull-request against any branch.
+# Three parallel jobs:
+#   backend-tests  — install Python deps, run 73-test pytest suite
+#   frontend-build — npm ci + npm run build (Vite production build)
+#   docker-build   — docker compose build (verifies both images compile)
+#
+# Nothing is deployed or pushed.  CD will be a separate workflow added later.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+# Cancel any in-flight run for the same branch/PR when a new commit arrives.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  # ── Job 1: Backend — pytest ──────────────────────────────────────────────────
+  backend-tests:
+    name: Backend Tests (Python 3.11)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install backend dependencies
+        run: pip install --no-cache-dir -r backend/requirements.txt
+
+      # conftest.py sets DATABASE_URL and JWT_SECRET_KEY before any module is
+      # imported, so no live database or real secrets are required for the
+      # unit test suite.
+      - name: Run pytest (73 tests)
+        run: pytest
+        env:
+          # Explicit env vars here act as a safety net in case conftest.py is
+          # ever refactored — the values match what conftest.py already sets.
+          DATABASE_URL: "postgresql+psycopg://test:test@localhost/campusshield_test"
+          JWT_SECRET_KEY: "test-secret-key-for-unit-tests-only-minimum-32-chars"
+
+  # ── Job 2: Frontend — Vite production build ──────────────────────────────────
+  frontend-build:
+    name: Frontend Build (Node 20)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build frontend (Vite production)
+        working-directory: frontend
+        run: npm run build
+
+      # Confirm the build produced output (dist/index.html must exist).
+      - name: Verify build artefact
+        run: test -f frontend/dist/index.html
+
+  # ── Job 3: Docker — build check ──────────────────────────────────────────────
+  docker-build:
+    name: Docker Build Check
+    runs-on: ubuntu-latest
+    # Only run after both application jobs pass — no point building images
+    # if the code itself is broken.
+    needs: [backend-tests, frontend-build]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Provide a minimal .env so the backend config validation passes during
+      # the image build.  These values are build-time only; no real DB is
+      # contacted — the backend starts, passes /health, then the build ends.
+      # The actual Neon DATABASE_URL is supplied at runtime via `docker compose
+      # up --env-file .env`, never stored in the image.
+      - name: Create minimal .env for build context
+        run: |
+          cat > .env <<'EOF'
+          APP_ENV=ci
+          DATABASE_URL=postgresql+psycopg://ci:ci@localhost/ci_db
+          JWT_SECRET_KEY=ci-build-check-secret-minimum-32-characters-long
+          STORAGE_PROVIDER=local
+          EOF
+
+      - name: Build backend image
+        run: docker compose build backend
+
+      - name: Build frontend image
+        run: docker compose build frontend
+
+      # Confirm both images were actually created by listing them.
+      - name: Verify images exist
+        run: |
+          docker compose images
+          docker compose images | grep -E "backend|frontend"

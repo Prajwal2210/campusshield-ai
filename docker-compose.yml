@@ -1,4 +1,20 @@
+# ── CampusShield AI — Docker Compose ─────────────────────────────────────────
+#
+# Services:   backend (FastAPI/uvicorn)  |  frontend (React/nginx)
+# Database:   Neon PostgreSQL — EXTERNAL, supplied via DATABASE_URL in .env
+#             No database service is defined here by design.
+#
+# Usage:
+#   1. Copy .env.example → .env and fill in DATABASE_URL + JWT_SECRET_KEY
+#   2. docker compose up --build
+#   3. Frontend → http://localhost:5173
+#      Backend  → http://localhost:8000
+#      API docs → http://localhost:8000/docs
+# ─────────────────────────────────────────────────────────────────────────────
+
 services:
+
+  # ── Backend — FastAPI / uvicorn ─────────────────────────────────────────────
   backend:
     build:
       context: .
@@ -7,16 +23,35 @@ services:
     ports:
       - "8000:8000"
     volumes:
+      # Named volume persists uploaded PCAPs, generated reports, and trained
+      # model files across container restarts.
       - campusshield_data:/app/backend/data
+    # Restart on crash or Docker daemon restart; manual `docker compose down`
+    # or Ctrl+C during local dev is NOT affected by unless-stopped.
+    restart: unless-stopped
+    healthcheck:
+      # Matches the HEALTHCHECK in backend/Dockerfile.
+      # Compose tracks this independently and exposes it to depends_on.
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
 
+  # ── Frontend — React (nginx) ─────────────────────────────────────────────────
   frontend:
     build:
       context: .
       dockerfile: frontend/Dockerfile
     depends_on:
-      - backend
+      backend:
+        # Wait until the backend passes its healthcheck before starting nginx.
+        # Prevents 502 Bad Gateway on the very first request after `up --build`.
+        condition: service_healthy
     ports:
       - "5173:80"
+    restart: unless-stopped
 
+# ── Volumes ───────────────────────────────────────────────────────────────────
 volumes:
   campusshield_data:
