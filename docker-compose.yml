@@ -43,6 +43,11 @@ services:
     build:
       context: .
       dockerfile: frontend/Dockerfile
+      args:
+        # Passes the Docker Compose internal service hostname so the baked
+        # nginx.conf proxies to the backend container — same as the old
+        # hardcoded value, now supplied explicitly as a build arg.
+        BACKEND_URL: http://backend:8000
     depends_on:
       backend:
         # Wait until the backend passes its healthcheck before starting nginx.
