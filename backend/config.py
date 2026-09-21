@@ -32,10 +32,18 @@ ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("TOKEN_EXPIRE_MINUTES", "480"))
 # ---------------------------------------------------------------------------
 # CORS
 # ---------------------------------------------------------------------------
-CORS_ORIGINS: list[str] = os.getenv(
-    "CORS_ORIGINS",
-    "http://localhost:5173,http://localhost:3000,http://127.0.0.1:5173",
-).split(",")
+# Default includes localhost dev origins and the deployed Render frontend.
+# Override at runtime by setting the CORS_ORIGINS environment variable to a
+# comma-separated list of allowed origins (no trailing slashes, no spaces).
+_DEFAULT_CORS = ",".join([
+    "http://localhost:5173",
+    "http://localhost:3000",
+    "http://127.0.0.1:5173",
+    "https://campusshield-frontend-ee1w.onrender.com",
+])
+CORS_ORIGINS: list[str] = [
+    o.strip() for o in os.getenv("CORS_ORIGINS", _DEFAULT_CORS).split(",") if o.strip()
+]
 
 # ---------------------------------------------------------------------------
 # Upload Limits
