@@ -19,7 +19,10 @@ frontend/.vite/
 .env
 .env.local
 .env.*.local
-.env.production
+# .env.production is intentionally NOT ignored: frontend/.env.production
+# contains only public build-time URLs (VITE_API_URL, VITE_WS_URL) and
+# must be committed so Vite bakes the correct backend address into the bundle.
+# Secret variants (.env.production.local) are covered by .env.*.local above.
 
 # IDE
 .idea/
